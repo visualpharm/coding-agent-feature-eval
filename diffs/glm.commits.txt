@@ -1,0 +1,3 @@
+7139ff1 Chat estimador: marco del relevamiento compartido, .gitignore para pack montado por symlink, ejemplos de contacto escaneables
+f182a09 Chat: estimador conversacional con informe en el hilo (tests, parsers es/en)
+6c63025 WIP chat estimator (glm)

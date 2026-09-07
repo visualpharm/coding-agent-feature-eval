@@ -1,0 +1,4 @@
+b47848f WIP chat estimator (sonnet-medium): keep test coordinates below the publication scan's leaked-address threshold
+6d87b2c WIP chat estimator (sonnet-medium): fix fresh-trigger geocoding bug, add test/chat-estimate.test.js
+7adcdd9 WIP chat estimator (sonnet-medium): wire the chat estimator flow into responder/store/routes
+eafdb37 WIP chat estimator (sonnet-medium): extract reportAnalysis into lib/quote-report-analysis.js

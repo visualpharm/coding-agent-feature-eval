@@ -1,0 +1,4 @@
+2b841f1 Validate persisted estimate state and remove pre-report visit fallbacks
+20a0e0e Harden estimator retries, interruption handling and chat regression coverage
+a3fe787 Add conversational solar estimator and token-protected reports
+369bf6e WIP chat estimator (codex)

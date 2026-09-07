@@ -1,0 +1,3 @@
+30b88bc Chat: elegir dirección como se hable, y no repetir la pregunta pendiente
+6932763 Chat: el estimador en forma de conversación, no una lista de planes
+60f216f WIP chat estimator (opus-low)

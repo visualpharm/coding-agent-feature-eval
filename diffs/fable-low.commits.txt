@@ -1,0 +1,3 @@
+abb75cb Test del estimador sin coordenadas de más de dos decimales
+289db7a Chat: el estimador entra al flujo del wizard y termina con el informe en el hilo
+f022f51 WIP chat estimator (fable-low)

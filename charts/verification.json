@@ -1,0 +1,18 @@
+{
+  "points": 6,
+  "score_domain": [
+    6,
+    10
+  ],
+  "cost_scale": "linear",
+  "label_overlaps": 0,
+  "label_connectors": 0,
+  "point_outlines": 0,
+  "pareto_curve": "Monotone visual guide through observed frontier points, not measured intermediate results",
+  "pareto_ids": [
+    "codex-astra-low",
+    "glm-zcode",
+    "glm-claude-code",
+    "fable-low"
+  ]
+}

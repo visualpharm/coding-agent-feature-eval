@@ -1,0 +1,1003 @@
+diff --git a/lib/quote-report-analysis.js b/lib/quote-report-analysis.js
+new file mode 100644
+index 0000000..06301ed
+--- /dev/null
++++ b/lib/quote-report-analysis.js
+@@ -0,0 +1,109 @@
++'use strict';
++/* La proyección de informe completa: la cotización (lib/customer-quote), el
++ * término de sombra (lib/roof-shade: relevamiento propio si el pin cae sobre
++ * un techo relevado, Google Solar si midió el paño, nada si no hay dato), el
++ * visor de sol con ese término (lib/sun-model), el marco del techo cuando hay
++ * foto propia con el paño medido, y el rango del control de paneles del
++ * informe.
++ *
++ * Extraído de server/server.js (2026-09-07) para que el estimador del chat
++ * (modules/nimba/estimate.js) cotice con la MISMA función que el wizard: la
++ * ruta HTTP y el hilo de chat nunca pueden divergir en cómo arman un informe.
++ * La misma función cotiza la primera vez, cada re-cotización desde el informe
++ * y ahora el flujo del chat. */
++const { preliminaryQuote } = require('./customer-quote');
++const roofShade = require('./roof-shade');
++const { sunViewerFor } = require('./sun-model');
++const { sunFramesIndex } = require('./sun-frames');
++const googleSunFrames = require('./google-sun-frames');
++const { studyNear } = require('./private-study');
++const { privateStudies } = require('./data-pack');
++
++const FALLBACK_REPORT_MAX_PANELS = 24;
++
++function privateRoofFrame(study) {
++  const photo = study?.roofPhoto;
++  if (!photo?.src || !photo.quad) return null;
++  return {
++    kind: 'photo', measurement: 'private-study', src: photo.src,
++    width: Number(photo.width), height: Number(photo.height),
++    view: Array.isArray(photo.view) ? photo.view.map(Number) : null, quad: photo.quad,
++    cols: Number(photo.cols) || 1, rows: Number(photo.rows) || 1, flush: photo.flush !== false,
++    roof: photo.roof && Array.isArray(photo.roof.quads) ? { quads: photo.roof.quads } : null,
++    label: 'Relevamiento propio con dron',
++  };
++}
++
++function reportAnalysis({ lead, intake, roofStudy }) {
++  const study = studyNear(privateStudies, lead.lat, lead.lng);
++  const photo = study && study.roofPhoto;
++  const frameCapacity = photo && photo.cols && photo.rows ? Number(photo.cols) * Number(photo.rows) : null;
++  /* A private drone survey with a fixed panel grid is a direct measurement
++   * of THIS roof; a Google Solar/AI-vision estimate is a generic guess over
++   * a satellite or model-traced polygon. When both exist for the same lead,
++   * the survey's own count is the roof capacity — it must set the ceiling
++   * preliminaryQuote actually prices against, never sit beside a lower
++   * estimate that silently wins through Math.min below. Overriding only
++   * roofCapacityPanels keeps every other building field (source label,
++   * sunlight, panel dots for the map fallback) exactly as fetched. */
++  const roofStudyForQuote = frameCapacity && roofStudy && roofStudy.building
++    ? { ...roofStudy, building: { ...roofStudy.building, roofCapacityPanels: frameCapacity } }
++    : roofStudy;
++  const building = roofStudyForQuote && roofStudyForQuote.building;
++  /* Size against the same annual exposure that the report will display. A
++   * private measured study wins; otherwise use Google's per-position yield.
++   * Run the Google estimate once more after resizing so the selected prefix of
++   * positions drives both the panel count and the output. This factor is fed
++   * into pricing exactly once; sunViewer receives the already shaded monthly
++   * series and therefore does not subtract it again. */
++  const rawMeasuredExposure = study?.system?.selectedArrayAnnualExposurePercent;
++  const measuredExposure = rawMeasuredExposure != null ? Number(rawMeasuredExposure) / 100 : NaN;
++  const measuredYield = Number(study?.system?.annualKwh) / Number(study?.system?.dcKwp);
++  const baseInput = { ...intake, country: lead.country || intake.country || 'AR', roofStudy: roofStudyForQuote,
++    ...(Number.isFinite(measuredExposure) && measuredExposure >= 0 ? { shadeExposure: measuredExposure } : {}),
++    ...(measuredYield > 0 && measuredExposure > 0 ? { unshadedAnnualKwhPerKwp: measuredYield / measuredExposure } : {}),
++  };
++  let analysis = preliminaryQuote(baseInput);
++  for (let pass = 0; pass < 2; pass += 1) {
++    let exposure = Number.isFinite(measuredExposure) && measuredExposure >= 0 ? measuredExposure : null;
++    if (exposure === null && building && Array.isArray(building.solarPanels)) {
++      const google = roofShade.googleExposure(building, analysis.panels, analysis.sunlight);
++      exposure = google && Number.isFinite(google.year) ? google.year : null;
++    }
++    if (exposure === null || !Number.isFinite(exposure) || Math.abs(exposure - Number(analysis.shadeExposure ?? 1)) < 0.0001) break;
++    analysis = preliminaryQuote({ ...baseInput, shadeExposure: exposure });
++  }
++  const shade = (study && roofShade.studyShade(study, analysis.kwp))
++    || roofShade.googleExposure(building, analysis.panels, analysis.sunlight)
++    || null;
++  analysis.sunViewer = sunViewerFor({ lat: lead.lat, kwp: analysis.kwp, sunlight: analysis.sunlight, shade, monthlyKwh: analysis.monthlyGenerationKwh });
++  /* El mapa de calor real del techo (lib/sun-frames.js): sólo qué cuadros
++   * medidos existen; sin relevamiento, null y el visor no pinta mancha. */
++  analysis.sunFrames = (study && sunFramesIndex(study)) || googleSunFrames.indexFor(building);
++  /* Sin relevamiento propio bajo el pin, un marco que el lead ya tenía se
++   * conserva: la distribución elegida en la guía vive sobre ese marco. */
++  const measuredProvider = analysis.roofLayout?.frame?.provider
++    || ({ 'google-solar': 'google', 'google-vision': 'google', 'apple-vision': 'apple', 'drone-vision': 'own' })[analysis.roofLayout?.source];
++  const previousFrame = (!measuredProvider || measuredProvider === 'own') && lead.analysis?.roofFrame?.kind === 'photo'
++    ? lead.analysis.roofFrame : null;
++  analysis.roofFrame = privateRoofFrame(study) || previousFrame;
++  const measuredMax = analysis.roofFrame
++    ? analysis.roofFrame.cols * analysis.roofFrame.rows
++    : (Number(analysis.roofLayout && analysis.roofLayout.maxPanels) || Number(building && building.roofCapacityPanels) || 0);
++  /* El tope del control es lo que la cotización va a honrar: la cantidad
++   * medida (paño relevado o posiciones) recortada por la superficie útil del
++   * techo, que es el mismo tope que aplica preliminaryQuote (sized.byArea).
++   * Un control que ofrece 12 y un precio que se queda en 8 es un control
++   * roto — y ese tope nunca depende de la cantidad elegida: roofStudyForQuote
++   * (medición fija de este lead) es el único insumo, jamás panelCount. */
++  const capacity = preliminaryQuote({ ...intake, panelCount: 999, roofStudy: roofStudyForQuote }).panels;
++  const max = Math.max(analysis.panels, Math.min(measuredMax || FALLBACK_REPORT_MAX_PANELS, capacity));
++  /* La cantidad recomendada es la que la cotización elige sola (consumo o
++   * caso de muestra, siempre dentro del techo), sin la cantidad pedida. */
++  const recommended = Math.min(max, preliminaryQuote({ ...baseInput, shadeExposure: analysis.shadeExposure, panelCount: null }).panels);
++  analysis.panelRange = { min: 1, max, recommended };
++  analysis.propertyContext = lead.propertyContext || roofStudy?.propertyContext || null;
++  return analysis;
++}
++
++module.exports = { reportAnalysis, privateRoofFrame, FALLBACK_REPORT_MAX_PANELS };
+diff --git a/modules/nimba/chat-routes.js b/modules/nimba/chat-routes.js
+index 23cc4a7..0205846 100644
+--- a/modules/nimba/chat-routes.js
++++ b/modules/nimba/chat-routes.js
+@@ -63,8 +63,8 @@ function simulationAllowed(req) {
+ 
+ /* Corre el respondedor sobre el último mensaje del hilo y persiste el
+  * resultado: banderas, escalado, la respuesta. Devuelve el hilo actualizado. */
+-async function respond(thread, text, visitor) {
+-  const result = await responder.answer({ thread, text, visitor });
++async function respond(thread, text, visitor, { cfg = null, host = null } = {}) {
++  const result = await responder.answer({ thread, text, visitor, cfg, host });
+   let updated = await store.recordAutoReply(thread.id,result);
+   /* Después de la primera respuesta en un hilo web: pedir que nos manden el
+    * código por WhatsApp, una sola vez, y sólo si hay número al que escribir. */
+@@ -94,10 +94,10 @@ async function sweepUnanswered() {
+ }
+ 
+ const replyQueues = new Map();
+-function enqueueReply(thread, text, visitor) {
++function enqueueReply(thread, text, visitor, opts) {
+   const next = (replyQueues.get(thread.id) || Promise.resolve()).then(async () => {
+     const current = store.getForInstaller(thread.installerId,thread.id);
+-    if (current?.auto && current.status !== 'closed') await respond({...current,messages:thread.messages},text,visitor);
++    if (current?.auto && current.status !== 'closed') await respond({...current,messages:thread.messages},text,visitor,opts);
+   }).catch(err => console.warn('[chat] reply deferred:',err.name));
+   replyQueues.set(thread.id,next);
+   next.finally(() => {if(replyQueues.get(thread.id)===next)replyQueues.delete(thread.id);});
+@@ -148,10 +148,11 @@ async function chatStart(ctx) {
+   catch (err) { await attachments.remove(saved); throw err; }
+   if (opened.duplicate) await attachments.remove(saved);
+   const visitor = { name: rawName, whatsapp: phone, email };
++  const host = String(req.headers.host || '');
+   let thread = opened;
+   if (opened.auto && !opened.duplicate) {
+-    if(body.async === true) enqueueReply(opened,message,visitor);
+-    else ({ thread } = await respond(opened, message, visitor));
++    if(body.async === true) enqueueReply(opened,message,visitor,{cfg,host});
++    else ({ thread } = await respond(opened, message, visitor, {cfg,host}));
+   }
+   const number = String(process.env.BRUNO_WHATSAPP_NUMBER || '').replace(/\D/g, '');
+   return sendJson(res, 200, {
+@@ -162,7 +163,8 @@ async function chatStart(ctx) {
+ 
+ /* Un mensaje más del visitante en su hilo, autorizado por el token. */
+ async function chatMessage(ctx) {
+-  const { req, res } = ctx;
++  const { req, res, cfg } = ctx;
++  const host = String(req.headers.host || '');
+   const body = await readAnyBody(req, 22 * 1024 * 1024);
+   const token = String(body.token || '').slice(0, 200);
+   const existing = token ? store.findByWebToken(token) : null;
+@@ -186,8 +188,8 @@ async function chatMessage(ctx) {
+   if (thread.auto && thread.status !== 'closed' && !thread.duplicate) {
+     const lead = thread.leadId ? customerLeads.getForInstaller(null, thread.leadId, { admin: true }) : null;
+     const visitor = { name: String(thread.name || '').replace(SIMULATION_PREFIX, ''), whatsapp: thread.whatsapp, email: lead?.contact?.email || '' };
+-    if(body.async === true) enqueueReply(thread,accepted.text,visitor);
+-    else ({ thread } = await respond(thread, accepted.text, visitor));
++    if(body.async === true) enqueueReply(thread,accepted.text,visitor,{cfg,host});
++    else ({ thread } = await respond(thread, accepted.text, visitor, {cfg,host}));
+   }
+   return sendJson(res, 200, { ok: true, thread: store.visitorView(thread) }, { 'Cache-Control': 'no-store' });
+ }
+@@ -345,7 +347,7 @@ async function chatSuggest(ctx) {
+   if (!suggestions.has(key)) {
+     const lead = t.leadId ? customerLeads.getForInstaller(null, t.leadId, { admin: true }) : null;
+     const visitor = { name: String(t.name || '').replace(SIMULATION_PREFIX, ''), whatsapp: t.whatsapp, email: lead?.contact?.email || '' };
+-    const p = responder.answer({ thread: t, text: last.text, visitor }).then((r) => r.text).catch(() => '');
++    const p = responder.answer({ thread: t, text: last.text, visitor, cfg, host: String(req.headers.host || ''), preview: true }).then((r) => r.text).catch(() => '');
+     suggestions.set(key, p);
+     if (suggestions.size > 200) suggestions.delete(suggestions.keys().next().value);
+   }
+diff --git a/modules/nimba/estimate.js b/modules/nimba/estimate.js
+new file mode 100644
+index 0000000..f5905b6
+--- /dev/null
++++ b/modules/nimba/estimate.js
+@@ -0,0 +1,339 @@
++'use strict';
++/* El estimador en el chat (Ivan, 2026-09-07): "el bot ignora nuestro
++ * producto". Bruno NO es un instalador que ofrece una visita — es el
++ * cotizador de IA del wizard (/quote/*) en forma de conversación. Ante
++ * cualquier pregunta de precio, este módulo toma la posta ANTES del modelo:
++ * un dato por mensaje (dirección, dueño/inquilino, consumo, qué busca,
++ * nombre, contacto), y al final crea el mismo lead que crea el wizard y
++ * cotiza con la MISMA función (lib/quote-report-analysis, extraída de
++ * server/server.js) — nunca una fórmula de precio propia del chat.
++ *
++ * El estado del flujo vive en thread.estimate = { step, data }, persistido
++ * por store.js (recordAutoReply). Sin clave de geocoder o de visión el
++ * estimador igual completa: el lead queda armado sin el estudio de techo
++ * (roofStudy null → preliminaryQuote arma con el caso de muestra publicado).
++ *
++ * NUNCA toca modules/nimba/widget.js ni support-copy.js (son de otra rama en
++ * curso): toda la copia de este flujo vive acá, aparte. */
++const customerLeads = require('../../lib/customer-leads');
++const { preliminaryQuote } = require('../../lib/customer-quote');
++const { reportAnalysis } = require('../../lib/quote-report-analysis');
++const roofInsights = require('../../lib/roof-insights');
++const roofVisionEstimator = require('../../lib/roof-vision-estimator');
++const geocode = require('../../lib/geocode');
++const whatsapp = require('../../lib/whatsapp');
++const PRICING = require('../../lib/pricing');
++
++const STEPS = ['address', 'address_choice', 'ownership', 'consumption', 'goal', 'name', 'contact', 'done'];
++const EMAIL_RE = /^\S+@\S+\.\S+$/;
++
++/* Ante cuál pregunta el estimador toma la posta: precio, presupuesto,
++ * cotización, "quiero instalar/paneles/solar", y el inglés equivalente.
++ * Deliberadamente amplio — Human Rounds: mejor un falso positivo (el modelo
++ * igual puede seguir si el visitante sólo preguntaba otra cosa) que dejar
++ * pasar "cuánto sale" a la charla genérica de siempre. */
++const INTENT_RE = /\b(cu[aá]nto (me )?(sale|cuesta|vale|saldr[ií]a)|precio|presupuesto|quiero (instalar|poner|paneles|solar)|me interesa (instalar|poner|paneles|solar)|instalar solar|poner paneles|paneles solares|how much|get a quote|solar quote|solar price|want (solar|panels)|install solar)\b/i;
++
++/* Detecta que el mensaje es una pregunta suelta (no una respuesta al paso
++ * en curso): el estimador la contesta con el modelo y repite lo pendiente,
++ * en vez de trabarse pidiendo lo mismo de nuevo. */
++const QUESTION_RE = /\?|^(qu[eé]|c[oó]mo|cu[aá]ndo|por qu[eé]|cu[aá]nto tarda|d[oó]nde|what|how|when|why|does|do you|is it|can you)\b/i;
++
++function detectsIntent(text) { return INTENT_RE.test(String(text || '')); }
++function isInterruption(text) { return QUESTION_RE.test(String(text || '').trim()); }
++
++function normalizeEstimate(raw) {
++  if (!raw || typeof raw !== 'object' || !STEPS.includes(raw.step)) return { step: 'address', data: {} };
++  return { step: raw.step, data: raw.data && typeof raw.data === 'object' ? raw.data : {} };
++}
++
++/* AR-style number: "45.000" (punto de miles), "45,50" (coma decimal), "45 mil". */
++function parseArNumber(raw) {
++  const s = String(raw || '').trim();
++  const mil = s.match(/^(\d+(?:[.,]\d+)?)\s*mil$/i);
++  if (mil) return Math.round(parseFloat(mil[1].replace(',', '.')) * 1000);
++  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) return Math.round(parseFloat(s.replace(/\./g, '').replace(',', '.')));
++  if (/^\d+,\d{1,2}$/.test(s)) return Math.round(parseFloat(s.replace(',', '.')));
++  const n = parseFloat(s.replace(/,/g, ''));
++  return Number.isFinite(n) ? Math.round(n) : null;
++}
++
++function parseConsumption(text) {
++  const t = String(text || '').trim();
++  if (/no\s*s[eé](\b|$)|ni\s*idea|no\s*tengo\s*idea|not\s*sure|no\s*idea|dont'?\s*know|don'?t\s*know|unsure/i.test(t)) return { unknown: true };
++  const kwh = t.match(/(\d+(?:[.,]\d+)?)\s*k\s?w\s?h/i);
++  if (kwh) {
++    const n = Math.round(parseFloat(kwh[1].replace(',', '.')));
++    if (n > 0) return { monthlyKwh: n };
++  }
++  const mil = t.match(/(\d+(?:[.,]\d+)?)\s*mil\b/i);
++  if (mil) return { monthlyBillArs: Math.round(parseFloat(mil[1].replace(',', '.')) * 1000) };
++  const money = t.match(/\$?\s*(\d{1,3}(?:[.,]\d{3})+|\d{2,7})/);
++  if (money) {
++    const n = parseArNumber(money[1]);
++    if (Number.isFinite(n) && n > 0) {
++      const hasCurrency = /\$|pesos?|\bars\b/i.test(t);
++      return hasCurrency || n >= 3000 ? { monthlyBillArs: n } : { monthlyKwh: n };
++    }
++  }
++  return null;
++}
++
++function parseOwnership(text) {
++  const t = String(text || '').toLowerCase();
++  if (/du[eñ]|propietari|owner|es m[ií]a|own(ed)?\b/.test(t)) return 'owner';
++  if (/alquil|inquilin|rent(er|ing)?\b/.test(t)) return 'renter';
++  if (/construy|construc|voy a construir|build(ing)?\b|planning/.test(t)) return 'planning';
++  if (isInterruption(t)) return null;
++  return 'other';
++}
++
++function parseGoal(text) {
++  const t = String(text || '').toLowerCase();
++  const save = /ahorr|reduci|save|lower/.test(t);
++  const backup = /respaldo|corte|apag[oó]n|sin luz|outage|backup|blackout/.test(t);
++  if (save && backup) return 'both';
++  if (/ambos|los dos|both/.test(t)) return 'both';
++  if (backup) return 'backup';
++  if (save) return 'save';
++  if (isInterruption(t)) return null;
++  return 'both';
++}
++
++function parseContact(text) {
++  const t = String(text || '').trim();
++  if (EMAIL_RE.test(t)) return { method: 'email', value: t.toLowerCase().slice(0, 254) };
++  const wa = whatsapp.toWaId(t);
++  if (wa.length >= 10) return { method: 'whatsapp', value: t.slice(0, 60) };
++  return null;
++}
++
++const COPY = {
++  es: {
++    address: 'Dale, te armo el presupuesto acá mismo. ¿Cuál es la dirección de la casa?',
++    addressRetry: 'No encontré esa dirección. ¿Me la escribís de nuevo, con calle, altura y localidad?',
++    addressChoice: (items) => `Encontré estas opciones, ¿cuál es la tuya?\n${items.map((it, i) => `${i + 1}) ${it.label}`).join('\n')}`,
++    addressChoiceRetry: 'Decime 1, 2 o 3 para elegir la dirección.',
++    ownership: '¿La casa es tuya, la alquilás, o la estás por construir?',
++    consumption: '¿Cuánto consumís por mes? Contame en kWh o cuánto pagás de luz; si no lo sabés, decime "no sé" y sigo con un valor de referencia.',
++    consumptionRetry: 'No te entendí el consumo. Decime un número en kWh, cuánto pagás de luz, o "no sé".',
++    goal: '¿Qué buscás: ahorrar en la factura, tener respaldo ante cortes, o ambos?',
++    name: '¿Cómo te llamás?',
++    nameRetry: 'Decime tu nombre para el informe.',
++    contact: 'Pasame tu mail o tu WhatsApp (con código de área) y te mando el informe.',
++    contactRetry: 'Ese mail o WhatsApp no me cierra. ¿Me lo pasás de nuevo?',
++    done: (s) => s,
++  },
++  en: {
++    address: 'Sure, let\'s put together your quote right here. What\'s the address of the house?',
++    addressRetry: 'I could not find that address. Can you write it again with street, number and town?',
++    addressChoice: (items) => `I found these, which one is yours?\n${items.map((it, i) => `${i + 1}) ${it.label}`).join('\n')}`,
++    addressChoiceRetry: 'Say 1, 2 or 3 to pick the address.',
++    ownership: 'Do you own the house, rent it, or is it being built?',
++    consumption: 'What is your monthly consumption? In kWh or your electricity bill amount; say "I don\'t know" and I\'ll use a reference value.',
++    consumptionRetry: 'I did not get that. Give me a number in kWh, your bill amount, or say you are not sure.',
++    goal: 'What are you after: lowering your bill, backup during outages, or both?',
++    name: 'What is your name?',
++    nameRetry: 'Tell me your name for the report.',
++    contact: 'Give me your email or WhatsApp (with area code) and I will send you the report.',
++    contactRetry: 'That email or WhatsApp does not look right. Can you send it again?',
++    done: (s) => s,
++  },
++};
++
++function copyFor(language) { return COPY[language] || COPY.en; }
++
++/* Salta un paso cuando el hilo ya sabe el dato (nombre real, WhatsApp
++ * verificado): nunca le repetimos a alguien un dato que ya nos dio. */
++function skippable(step, { thread, data }) {
++  if (step === 'name') return Boolean(String(thread.name || '').trim()) ? String(thread.name || '').trim() : null;
++  if (step === 'contact' && thread.verified && thread.whatsapp) return { method: 'whatsapp', value: thread.whatsapp };
++  return null;
++}
++
++function nextOpenStep(from, ctx) {
++  let i = STEPS.indexOf(from);
++  while (STEPS[i] !== 'done') {
++    i += 1;
++    const step = STEPS[i];
++    if (step === 'address_choice') continue; // sólo se entra explícitamente, nunca de paso
++    const known = skippable(step, ctx);
++    if (known !== null) { ctx.data[step] = known; continue; }
++    return step;
++  }
++  return 'done';
++}
++
++function ownerFor(cfg) {
++  if (cfg && cfg.installerId) return cfg;
++  const { whitelabel } = require('../../lib/data-pack');
++  const { acquisitionSite } = require('../../lib/homeowner-routing');
++  return acquisitionSite(whitelabel);
++}
++
++function absoluteUrl(host, pathname) {
++  const h = String(host || 'usabruno.com').split(',')[0].trim();
++  return `https://${h}${pathname}`;
++}
++
++const backupFor = (goal) => (goal === 'save' ? 'none' : goal === 'backup' ? 'full' : 'essential');
++const money = (n) => Math.round(Number(n) || 0).toLocaleString('es-AR');
++
++function summaryText(analysis, language) {
++  const plan = analysis.plans.find((p) => p.recommended) || analysis.plans[0];
++  const kwp = (Number(analysis.kwp) || 0).toFixed(1);
++  const savingsArs = analysis.gridPriceArsPerKwh && analysis.annualKwh
++    ? Math.round(analysis.annualKwh * analysis.gridPriceArsPerKwh) : null;
++  if (language === 'en') {
++    const savings = savingsArs ? ` It should save you around AR$ ${money(savingsArs)} a year in electricity.` : '';
++    return `With ${analysis.panels} panels (${kwp} kWp) the ${plan.name} plan runs USD ${money(plan.total)}.${savings} Here is your full report:`;
++  }
++  const savings = savingsArs ? ` Ahorrarías cerca de AR$ ${money(savingsArs)} por año en luz.` : '';
++  return `Con ${analysis.panels} paneles (${kwp} kWp) el plan ${plan.name} te sale USD ${money(plan.total)}.${savings} Este es tu informe:`;
++}
++
++/* Arma el lead, corre el mismo análisis que /api/quote/analysis y devuelve el
++ * mensaje final con el link al informe. Nunca lanza: un fallo de geocoder o
++ * de visión deja el lead con roofStudy null (preliminaryQuote arma con el
++ * caso de muestra), nunca sin informe. */
++async function complete({ thread, data, cfg, host, fetchImpl, language }) {
++  const owner = ownerFor(cfg);
++  const installerId = owner && owner.installerId;
++  if (!installerId) return null;
++  const created = await customerLeads.create({
++    installerId, source: 'site-chat-estimator', address: data.address, lat: data.lat, lng: data.lng, country: 'AR',
++  });
++  const contact = data.contact || {};
++  await customerLeads.setContact(created.id, created.access, {
++    name: data.name || thread.name || '', email: contact.method === 'email' ? contact.value : '',
++    whatsapp: contact.method === 'whatsapp' ? contact.value : (thread.whatsapp || ''), followupConsent: true, marketingConsent: false,
++  });
++  let roofStudy = null;
++  try { roofStudy = await roofInsights.studyFor(data.lat, data.lng, { fetchImpl, imagery: roofVisionEstimator.normalizeImagery(null), owner }); }
++  catch (err) { console.warn('[chat] estimator roof study failed:', err.message); }
++  const intake = {
++    country: 'AR', monthlyKwh: data.monthlyKwh || null, monthlyBillArs: data.monthlyBillArs || null,
++    billCurrency: 'ARS', sourceBillCurrency: 'ARS', gridPriceArsPerKwh: PRICING.GRID_PRICE_PER_KWH, gridPricePerKwh: PRICING.GRID_PRICE_PER_KWH,
++    consumptionSource: data.monthlyBillArs ? 'monthly-bill' : data.monthlyKwh ? 'unknown' : 'unknown',
++    intent: data.goal === 'save' ? 'save' : data.goal === 'backup' ? 'backup' : 'other',
++    ownership: ['owner', 'renter', 'planning'].includes(data.ownership) ? data.ownership : 'other',
++    phase: 'single', roofType: 'unknown', shade: 'unknown', backup: backupFor(data.goal),
++  };
++  const lead = customerLeads.get(created.id, created.access);
++  const analysis = reportAnalysis({ lead, intake, roofStudy });
++  const updated = await customerLeads.setAnalysis(created.id, created.access, { intake, invoice: null, panelPhoto: null, analysis, roofStudy });
++  const resultUrl = `/quote/results/${encodeURIComponent(created.id)}?t=${encodeURIComponent(created.access)}`;
++  return {
++    text: summaryText(updated.analysis, language),
++    links: [{ label: language === 'en' ? 'See my report' : 'Ver mi informe', href: absoluteUrl(host, resultUrl) }],
++  };
++}
++
++/* Un turno del estimador. Devuelve null si este mensaje no le toca (ni hay
++ * flujo activo ni el mensaje lo dispara): quien llama sigue con el modelo. */
++async function step({ thread, text, active, cfg, host, fetchImpl, language, askLlm, preview = false }) {
++  const state = active ? normalizeEstimate(thread.estimate) : { step: 'address', data: {} };
++  const ctx = { thread, data: state.data };
++  const c = copyFor(language);
++
++  const askPending = (currentStep) => {
++    const known = skippable(currentStep, ctx);
++    if (known !== null) { ctx.data[currentStep] = known; return askPending(nextOpenStep(currentStep, ctx)); }
++    if (currentStep === 'address_choice') return c.addressChoice(ctx.data.addressCandidates || []);
++    return c[currentStep];
++  };
++
++  async function interrupt(currentStep) {
++    const answer = askLlm ? await askLlm() : '';
++    const pending = askPending(currentStep);
++    return { text: answer ? `${answer} ${pending}` : pending, estimate: { step: currentStep, data: ctx.data } };
++  }
++
++  // Fresh trigger: the message that asked for a price is itself the intent
++  // signal, never an answer — it must never be geocoded as if it were an
++  // address. Just ask the first question (never skippable on its own — see
++  // the "left undone" note in the report about detecting an address already
++  // mentioned in the triggering message).
++  if (!active) return { text: askPending('address'), estimate: { step: 'address', data: ctx.data } };
++
++  let currentStep = state.step;
++
++  if (currentStep === 'address') {
++    let results = [];
++    try { results = await geocode.searchAddress(text, { cfg: ownerFor(cfg), fetchImpl }); } catch (err) { results = []; }
++    if (!results.length) {
++      if (active && isInterruption(text)) return interrupt('address');
++      return { text: c.addressRetry, estimate: { step: 'address', data: ctx.data } };
++    }
++    if (results.length === 1) {
++      ctx.data.address = results[0].label; ctx.data.lat = results[0].lat; ctx.data.lng = results[0].lng;
++      currentStep = nextOpenStep('address', ctx);
++    } else {
++      ctx.data.addressCandidates = results.slice(0, 3).map((r) => ({ label: r.label, lat: r.lat, lng: r.lng }));
++      return { text: c.addressChoice(ctx.data.addressCandidates), estimate: { step: 'address_choice', data: ctx.data } };
++    }
++  } else if (currentStep === 'address_choice') {
++    const n = parseInt(String(text || '').match(/[123]/)?.[0] || '', 10);
++    const pick = n && ctx.data.addressCandidates && ctx.data.addressCandidates[n - 1];
++    if (!pick) {
++      if (isInterruption(text)) return interrupt('address_choice');
++      return { text: c.addressChoiceRetry, estimate: { step: 'address_choice', data: ctx.data } };
++    }
++    ctx.data.address = pick.label; ctx.data.lat = pick.lat; ctx.data.lng = pick.lng;
++    delete ctx.data.addressCandidates;
++    currentStep = nextOpenStep('address', ctx);
++  } else if (currentStep === 'ownership') {
++    const parsed = parseOwnership(text);
++    if (!parsed) return interrupt('ownership');
++    ctx.data.ownership = parsed;
++    currentStep = nextOpenStep('ownership', ctx);
++  } else if (currentStep === 'consumption') {
++    const parsed = parseConsumption(text);
++    if (!parsed) {
++      if (isInterruption(text)) return interrupt('consumption');
++      return { text: c.consumptionRetry, estimate: { step: 'consumption', data: ctx.data } };
++    }
++    if (!parsed.unknown) Object.assign(ctx.data, parsed);
++    currentStep = nextOpenStep('consumption', ctx);
++  } else if (currentStep === 'goal') {
++    const parsed = parseGoal(text);
++    if (!parsed) return interrupt('goal');
++    ctx.data.goal = parsed;
++    currentStep = nextOpenStep('goal', ctx);
++  } else if (currentStep === 'name') {
++    const name = String(text || '').trim().slice(0, 140).replace(/^[¿?¡!.]+|[.!?]+$/g, '');
++    if (!name || name.length < 2) return { text: c.nameRetry, estimate: { step: 'name', data: ctx.data } };
++    ctx.data.name = name;
++    currentStep = nextOpenStep('name', ctx);
++  } else if (currentStep === 'contact') {
++    const parsed = parseContact(text);
++    if (!parsed) {
++      if (isInterruption(text)) return interrupt('contact');
++      return { text: c.contactRetry, estimate: { step: 'contact', data: ctx.data } };
++    }
++    ctx.data.contact = parsed;
++    currentStep = nextOpenStep('contact', ctx);
++  }
++
++  if (currentStep === 'done') {
++    /* Vista previa para el panel (chatSuggest, cuando el bot está apagado y
++     * una persona redacta a mano): nunca crea el lead de verdad — el hilo no
++     * quedó guardado con este último dato hasta que el mensaje se manda. */
++    if (preview) {
++      return { text: language === 'en' ? 'Ready to generate the report — send this reply to create it.' : 'Listo para generar el informe — mandá esta respuesta para crearlo.', estimate: { step: 'contact', data: ctx.data } };
++    }
++    const result = await complete({ thread, data: ctx.data, cfg, host, fetchImpl, language }).catch((err) => {
++      console.warn('[chat] estimator completion failed:', err.message);
++      return null;
++    });
++    if (!result) {
++      return { text: language === 'en'
++        ? 'I could not put your report together right now. Bruno will follow up with your estimate shortly.'
++        : 'No pude armar el informe ahora. Bruno te manda el presupuesto en un rato.', estimate: null };
++    }
++    return { ...result, estimate: { step: 'done', data: ctx.data } };
++  }
++  return { text: askPending(currentStep), estimate: { step: currentStep, data: ctx.data } };
++}
++
++module.exports = { detectsIntent, isInterruption, step, parseConsumption, parseOwnership, parseGoal, parseContact, STEPS };
+diff --git a/modules/nimba/responder.js b/modules/nimba/responder.js
+index c518ff0..cb7f9e6 100644
+--- a/modules/nimba/responder.js
++++ b/modules/nimba/responder.js
+@@ -23,6 +23,7 @@
+ const llm = require('../../lib/llm-chat');
+ const guardrails = require('./guardrails');
+ const abuse = require('./chat-abuse');
++const estimate = require('./estimate');
+ 
+ const CONTACT = 'Bruno';
+ const SOFT_MAX_CHARS = 420;
+@@ -61,7 +62,7 @@ function systemPrompt({ language, visitorName, f }) {
+     'Understand the current problem first. For website/account support, give a short relevant next step; do not redirect it to an installation sales pitch. Password recovery is on /account/login using Forgot password, reusing the email already entered. Never ask for passwords, reset links, codes or payment details; never claim to reset an account or inspect private account/installation records. The user can attach screenshots/PDFs for staff and continue on WhatsApp with the conversation code. You cannot read attachment contents; ask what the person wants checked and hand off attachment interpretation. For a concrete account action, direct the visitor to the authenticated page. Staff can continue in this same chat.',
+     '',
+     'HECHOS (lo único que podés afirmar; todo lo demás lo confirma la visita):',
+-    ...(f.plans.length ? [`Referencia para una casa que consume 450 kWh por mes: ${f.plans.join(' · ')}. Son precios de referencia: el número final sale del consumo real y del techo.`] : ['No tenés precios a mano: el precio sale de la cotización online o de la visita.']),
++    ...(f.plans.length ? [`Referencia interna, para vos, de una casa que consume 450 kWh por mes: ${f.plans.join(' · ')}. Nunca la tires de una: es sólo si ya te insistieron mucho con un número, y ahí das UNA sola referencia en una frase, no la lista.`] : ['No tenés precios a mano: el precio sale de la cotización online o de la visita.']),
+     ...(f.warranty.length ? [`Garantías: ${f.warranty.join('; ')}.`] : []),
+     ...(f.payment ? [`Forma de pago: ${f.payment}`] : []),
+     ...(f.delivery ? [`Plazo: ${f.delivery}`] : []),
+@@ -72,6 +73,8 @@ function systemPrompt({ language, visitorName, f }) {
+     'Comercios y hoteles: sí, trifásico incluido; el plazo de obra se coordina fuera de temporada.',
+     '',
+     'REGLAS:',
++    'Nuestro producto es el presupuesto con IA: cuando pregunten precio, costo o presupuesto, la conversación ya te lo está armando paso a paso (dirección, consumo, contacto) — vos no tirás precios de lista ni cortás ese flujo con otra respuesta; seguí el tema puntual que te trajeron sin interrumpirlo.',
++    'Nunca ofrezcas una visita técnica antes de que el presupuesto ya se haya armado y mostrado en el chat. Después de mostrado, ofrecela una sola vez, sin insistir si dicen que no.',
+     'Nunca des instrucciones eléctricas de ningún tipo (qué cable, qué borne, cómo conectar, cómo puentear), ni siquiera "para saber". Explicá por qué no y ofrecé la visita.',
+     'Nunca garantices resultados absolutos (cero cortes, nunca más sin luz, ahorro exacto). Decí qué cubre y qué no.',
+     'Nunca prometas una fecha u hora concreta de visita: proponé franjas (mañana, tarde, entre semana, sábado) y decí que INSTALLER confirma el turno por acá o por WhatsApp.',
+@@ -107,8 +110,12 @@ function recentInboundFlags(thread, language) {
+ /* Decide y redacta la respuesta a `text` (el último mensaje del visitante,
+  * ya guardado en `thread`). Devuelve { text, mode, flags, escalate, reason,
+  * language }. `mode`: 'safe' (enlatada por barrera), 'handoff' (escalado),
+- * 'model' (redactó el modelo), 'fallback' (sin modelo o modelo rechazado). */
+-async function answer({ thread, text, visitor = {}, fetchImpl, now = Date.now }) {
++ * 'estimate' (el estimador determinístico, modules/nimba/estimate.js),
++ * 'model' (redactó el modelo), 'fallback' (sin modelo o modelo rechazado).
++ * `cfg`/`host`: el sitio y el host de la request, para que el estimador
++ * geocodifique con el instalador correcto y arme el link absoluto al
++ * informe (server/server.js pasa lo mismo a /api/quote/*). */
++async function answer({ thread, text, visitor = {}, fetchImpl, now = Date.now, cfg = null, host = null, preview = false }) {
+   const lockedLanguage = thread.language || guardrails.detectLanguage(thread.messages[0]?.text || text, 'es');
+   const inbound = guardrails.classifyInbound(text, {
+     previousFlags: thread.flags || [],
+@@ -139,6 +146,35 @@ async function answer({ thread, text, visitor = {}, fetchImpl, now = Date.now })
+   if (hard && hard !== 'complaint' && hard !== 'wants_human' && !(softOnce.includes(hard) && (thread.flags || []).includes(hard))) {
+     return { ...base, mode: 'safe', text: guardrails.safeReply(hard, { language, contact }) };
+   }
++
++  /* El estimador toma la posta ANTES del modelo (Ivan, 2026-09-07: "el bot
++   * ignora nuestro producto"). Ante cualquier pregunta de precio/presupuesto,
++   * o si el hilo ya viene completando el flujo de un turno anterior, un dato
++   * por mensaje hasta mostrar el informe — nunca la charla genérica de
++   * cualquier instalador. Es determinístico y funciona sin clave de modelo;
++   * sólo gasta el modelo si el visitante se desvía con otra pregunta a mitad
++   * de camino (modules/nimba/estimate.js interrupt()). */
++  const activeEstimate = Boolean(thread.estimate && thread.estimate.step && thread.estimate.step !== 'done');
++  if (activeEstimate || estimate.detectsIntent(text)) {
++    const askLlm = async () => {
++      const llmOffline = process.env.NODE_ENV === 'test' && !fetchImpl;
++      if (!llm.configured() || llmOffline || !abuse.canSpendModelReply(now()).ok) return '';
++      const f = facts();
++      const messages = [
++        { role: 'system', content: systemPrompt({ language, visitorName: guardrails.firstName(visitor.name || thread.name), f }) },
++        ...history(thread, visitor),
++        { role: 'system', content: 'El visitante está armando su presupuesto paso a paso en este chat. Contestá SÓLO su pregunta suelta, en una oración corta; no retomes el paso pendiente (te lo agrego yo después) ni ofrezcas una visita.' },
++        { role: 'system', content: (REMINDER[language] || REMINDER.en) + ' Reply in language code ' + language + '.' },
++      ];
++      const attempt = await llm.complete({ messages, fetchImpl, maxTokens: 150, temperature: 0.4 });
++      if (!attempt.ok) return '';
++      const checked = guardrails.checkOutbound(attempt.text, { language, visitor });
++      return checked.ok ? checked.text : '';
++    };
++    const result = await estimate.step({ thread, text, active: activeEstimate, cfg, host, fetchImpl, language, askLlm, preview });
++    return { ...base, mode: 'estimate', text: result.text, links: result.links || [], estimate: result.estimate };
++  }
++
+   const flagNote = hard && softOnce.includes(hard)
+     ? { role: 'system', content: hard === 'out_of_area' ? 'El visitante insiste con una zona que no cubrimos: ya se lo dijiste. Orientá con tamaño de sistema y cerrá amable, sin repetir la lista de localidades.' : 'El visitante sigue fuera de tema: ya se lo dijiste. Volvé al tema en una oración.' }
+     : null;
+diff --git a/modules/nimba/store.js b/modules/nimba/store.js
+index 64a3ac5..5f6b6be 100644
+--- a/modules/nimba/store.js
++++ b/modules/nimba/store.js
+@@ -54,6 +54,10 @@ function normalize(state) {
+      * código por WhatsApp. nudgeCount: recordatorios enviados (Dawson). */
+     if (!('continuityAskedAt' in t)) t.continuityAskedAt = null;
+     if (typeof t.nudgeCount !== 'number') t.nudgeCount = t.messages.filter((m) => m.nudge).length;
++    /* El estimador en el chat (modules/nimba/estimate.js, 2026-09-07): el paso
++     * en curso y lo que ya juntó, para retomar el flujo mensaje a mensaje sin
++     * volver a pedir un dato. null cuando no hay estimador activo ni completo. */
++    if (!('estimate' in t)) t.estimate = null;
+   }
+   return state;
+ }
+@@ -90,7 +94,7 @@ function newThread({ whatsapp, name, leadId, installerId, verified, origin, simu
+     /* language: fijado con el primer mensaje (Human Rounds chat_language):
+      * la conversación no cambia de idioma a mitad de camino. */
+     simulated: !!simulated, status: 'open', auto: !!auto, flags: [], webTokenHash: null, language: normalizeLanguage(language),
+-    continuityAskedAt: null, nudgeCount: 0,
++    continuityAskedAt: null, nudgeCount: 0, estimate: null,
+     unread: 0, lastInAt: null, lastOutAt: null, lastWhatsappInAt: null, messages: [],
+   };
+ }
+@@ -232,6 +236,10 @@ async function recordAutoReply(id,result) {
+     if(!t.auto||t.status==='closed')return safe(t);
+     for(const f of result.flags||[])if(!t.flags.includes(f))t.flags.push(f);
+     if(result.escalate){t.status='escalated';}
++    /* El estimador (modules/nimba/estimate.js) manda su próprio paso en cada
++     * turno; `undefined` significa "no tocar" (una barrera enlatada no toca
++     * el estimador en curso), `null` lo cierra explícitamente. */
++    if('estimate' in result)t.estimate=result.estimate;
+     const at=new Date().toISOString();
+     t.messages.push({id:crypto.randomUUID(),dir:'out',channel:'web',text:result.text,by:'Bruno (auto)',auto:true,at,links:result.links||[]});t.lastOutAt=at;
+     return safe(t);
+diff --git a/server/server.js b/server/server.js
+index a0b70de..3ac01fd 100644
+--- a/server/server.js
++++ b/server/server.js
+@@ -1349,97 +1349,11 @@ router.add('GET', /^\/api\/quote\/result\/([^/]+)$/, async ({ res, cfg, url }, i
+   }, { 'Cache-Control': 'no-store' });
+ });
+ 
+-/* El informe entero sale de acá: la cotización (lib/customer-quote), el
+- * término de sombra (lib/roof-shade: relevamiento propio si el pin cae sobre
+- * un techo relevado, Google Solar si midió el paño, nada si no hay dato), el
+- * visor de sol con ese término (lib/sun-model), el marco del techo cuando hay
+- * foto propia con el paño medido, y el rango del control de paneles del
+- * informe. La misma función cotiza la primera vez y cada re-cotización desde
+- * el informe, así los dos caminos nunca divergen. */
+-const FALLBACK_REPORT_MAX_PANELS = 24;
+-function privateRoofFrame(study) {
+-  const photo = study?.roofPhoto;
+-  if (!photo?.src || !photo.quad) return null;
+-  return {
+-    kind: 'photo', measurement: 'private-study', src: photo.src,
+-    width: Number(photo.width), height: Number(photo.height),
+-    view: Array.isArray(photo.view) ? photo.view.map(Number) : null, quad: photo.quad,
+-    cols: Number(photo.cols) || 1, rows: Number(photo.rows) || 1, flush: photo.flush !== false,
+-    roof: photo.roof && Array.isArray(photo.roof.quads) ? { quads: photo.roof.quads } : null,
+-    label: 'Relevamiento propio con dron',
+-  };
+-}
+-function reportAnalysis({ lead, intake, roofStudy }) {
+-  const study = studyNear(privateStudies, lead.lat, lead.lng);
+-  const photo = study && study.roofPhoto;
+-  const frameCapacity = photo && photo.cols && photo.rows ? Number(photo.cols) * Number(photo.rows) : null;
+-  /* A private drone survey with a fixed panel grid is a direct measurement
+-   * of THIS roof; a Google Solar/AI-vision estimate is a generic guess over
+-   * a satellite or model-traced polygon. When both exist for the same lead,
+-   * the survey's own count is the roof capacity — it must set the ceiling
+-   * preliminaryQuote actually prices against, never sit beside a lower
+-   * estimate that silently wins through Math.min below. Overriding only
+-   * roofCapacityPanels keeps every other building field (source label,
+-   * sunlight, panel dots for the map fallback) exactly as fetched. */
+-  const roofStudyForQuote = frameCapacity && roofStudy && roofStudy.building
+-    ? { ...roofStudy, building: { ...roofStudy.building, roofCapacityPanels: frameCapacity } }
+-    : roofStudy;
+-  const building = roofStudyForQuote && roofStudyForQuote.building;
+-  /* Size against the same annual exposure that the report will display. A
+-   * private measured study wins; otherwise use Google's per-position yield.
+-   * Run the Google estimate once more after resizing so the selected prefix of
+-   * positions drives both the panel count and the output. This factor is fed
+-   * into pricing exactly once; sunViewer receives the already shaded monthly
+-   * series and therefore does not subtract it again. */
+-  const rawMeasuredExposure = study?.system?.selectedArrayAnnualExposurePercent;
+-  const measuredExposure = rawMeasuredExposure != null ? Number(rawMeasuredExposure) / 100 : NaN;
+-  const measuredYield = Number(study?.system?.annualKwh) / Number(study?.system?.dcKwp);
+-  const baseInput = { ...intake, country: lead.country || intake.country || 'AR', roofStudy: roofStudyForQuote,
+-    ...(Number.isFinite(measuredExposure) && measuredExposure >= 0 ? { shadeExposure: measuredExposure } : {}),
+-    ...(measuredYield > 0 && measuredExposure > 0 ? { unshadedAnnualKwhPerKwp: measuredYield / measuredExposure } : {}),
+-  };
+-  let analysis = preliminaryQuote(baseInput);
+-  for (let pass = 0; pass < 2; pass += 1) {
+-    let exposure = Number.isFinite(measuredExposure) && measuredExposure >= 0 ? measuredExposure : null;
+-    if (exposure === null && building && Array.isArray(building.solarPanels)) {
+-      const google = roofShade.googleExposure(building, analysis.panels, analysis.sunlight);
+-      exposure = google && Number.isFinite(google.year) ? google.year : null;
+-    }
+-    if (exposure === null || !Number.isFinite(exposure) || Math.abs(exposure - Number(analysis.shadeExposure ?? 1)) < 0.0001) break;
+-    analysis = preliminaryQuote({ ...baseInput, shadeExposure: exposure });
+-  }
+-  const shade = (study && roofShade.studyShade(study, analysis.kwp))
+-    || roofShade.googleExposure(building, analysis.panels, analysis.sunlight)
+-    || null;
+-  analysis.sunViewer = sunViewerFor({ lat: lead.lat, kwp: analysis.kwp, sunlight: analysis.sunlight, shade, monthlyKwh: analysis.monthlyGenerationKwh });
+-  /* El mapa de calor real del techo (lib/sun-frames.js): sólo qué cuadros
+-   * medidos existen; sin relevamiento, null y el visor no pinta mancha. */
+-  analysis.sunFrames = (study && sunFramesIndex(study)) || googleSunFrames.indexFor(building);
+-  /* Sin relevamiento propio bajo el pin, un marco que el lead ya tenía se
+-   * conserva: la distribución elegida en la guía vive sobre ese marco. */
+-  const measuredProvider = analysis.roofLayout?.frame?.provider
+-    || ({ 'google-solar': 'google', 'google-vision': 'google', 'apple-vision': 'apple', 'drone-vision': 'own' })[analysis.roofLayout?.source];
+-  const previousFrame = (!measuredProvider || measuredProvider === 'own') && lead.analysis?.roofFrame?.kind === 'photo'
+-    ? lead.analysis.roofFrame : null;
+-  analysis.roofFrame = privateRoofFrame(study) || previousFrame;
+-  const measuredMax = analysis.roofFrame
+-    ? analysis.roofFrame.cols * analysis.roofFrame.rows
+-    : (Number(analysis.roofLayout && analysis.roofLayout.maxPanels) || Number(building && building.roofCapacityPanels) || 0);
+-  /* El tope del control es lo que la cotización va a honrar: la cantidad
+-   * medida (paño relevado o posiciones) recortada por la superficie útil del
+-   * techo, que es el mismo tope que aplica preliminaryQuote (sized.byArea).
+-   * Un control que ofrece 12 y un precio que se queda en 8 es un control
+-   * roto — y ese tope nunca depende de la cantidad elegida: roofStudyForQuote
+-   * (medición fija de este lead) es el único insumo, jamás panelCount. */
+-  const capacity = preliminaryQuote({ ...intake, panelCount: 999, roofStudy: roofStudyForQuote }).panels;
+-  const max = Math.max(analysis.panels, Math.min(measuredMax || FALLBACK_REPORT_MAX_PANELS, capacity));
+-  /* La cantidad recomendada es la que la cotización elige sola (consumo o
+-   * caso de muestra, siempre dentro del techo), sin la cantidad pedida. */
+-  const recommended = Math.min(max, preliminaryQuote({ ...baseInput, shadeExposure: analysis.shadeExposure, panelCount: null }).panels);
+-  analysis.panelRange = { min: 1, max, recommended };
+-  analysis.propertyContext = lead.propertyContext || roofStudy?.propertyContext || null;
+-  return analysis;
+-}
++/* El informe entero: extraído a lib/quote-report-analysis.js (2026-09-07) para
++ * que el estimador del chat cotice con la MISMA función, nunca una fórmula
++ * propia. La misma función cotiza la primera vez, cada re-cotización desde el
++ * informe y ahora el flujo del chat — los caminos nunca divergen. */
++const { reportAnalysis, privateRoofFrame, FALLBACK_REPORT_MAX_PANELS } = require('../lib/quote-report-analysis');
+ 
+ /* Otra cantidad de paneles o la fase del servicio desde el informe: re-cotiza
+  * con la medición guardada (o la vuelve a pedir una vez si el lead es anterior
+diff --git a/test/chat-estimate.test.js b/test/chat-estimate.test.js
+new file mode 100644
+index 0000000..0c32357
+--- /dev/null
++++ b/test/chat-estimate.test.js
+@@ -0,0 +1,196 @@
++'use strict';
++/* El estimador en el chat (Ivan, 2026-09-07): "el bot ignora nuestro
++ * producto". Ante cualquier pregunta de precio, el respondedor arma el
++ * presupuesto paso a paso — dirección, dueño/inquilino, consumo, qué busca,
++ * nombre, contacto — y termina mostrando el informe real (/quote/results)
++ * en el hilo. Nunca la charla genérica ni la lista de precios de referencia.
++ *
++ * El geocoder y el modelo se stubean con un solo fetch falso que discrimina
++ * por URL (Google Places vs OpenRouter); cualquier otra URL (Google Solar,
++ * OSM, ARBA) falla a propósito para que roofInsights.studyFor() quede sin
++ * estudio — el estimador arma igual el informe con el caso de muestra. */
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('fs');
++const path = require('path');
++const os = require('os');
++
++process.env.NODE_ENV = 'test';
++process.env.BRUNO_DATA_PACK = 'demo';
++process.env.BRUNO_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'bruno-chat-estimate-'));
++delete process.env.OPENROUTER_API_KEY;
++process.env.BRUNO_OPENROUTER_API_KEY = 'test-key-not-real';
++process.env.BRUNO_CHAT_MODEL = 'test/model';
++process.env.BRUNO_GOOGLE_PLACES_API_KEY = 'test-places-key-not-real';
++
++const store = require('../modules/nimba/store');
++const responder = require('../modules/nimba/responder');
++
++/* Un candidato de dirección sin número de calle: la búsqueda entonces nunca
++ * dispara los pasos de "aterrizar en el lote" (OSM/ARBA), que no están
++ * stubeados acá — ver lib/geocode.js#landOnLot. Dentro del área de servicio
++ * del pack demo (Costa Atlántica). */
++// Coarse two-decimal points (~1 km), never a real street-level fix: the
++// publication scan blocks lat/lng-labeled fields with 3+ decimals as a
++// leaked-address guard (docs/publication-manifest.json), and a geocoder
++// stub has no reason to fake more precision than that anyway.
++const CARILO = { label: 'Cariló, Pinamar, Buenos Aires', lat: -37.17, lng: -56.88 };
++const PINAMAR = { label: 'Pinamar, Buenos Aires', lat: -37.11, lng: -56.86 };
++const VALERIA = { label: 'Valeria del Mar, Buenos Aires', lat: -37.24, lng: -56.93 };
++
++function placesResponse(candidates) {
++  return { ok: true, status: 200, json: async () => ({ status: 'OK', candidates: candidates.map((c) => ({ formatted_address: c.label, geometry: { location: { lat: c.lat, lng: c.lng } } })) }) };
++}
++function llmResponse(text) {
++  return { ok: true, status: 200, json: async () => ({ model: 'test/model', choices: [{ message: { content: text } }] }) };
++}
++
++/* fetchImpl único para todo el turno: Google Places para el geocoder,
++ * OpenRouter para el modelo (interrupciones), cualquier otra URL falla a
++ * propósito (roofInsights, sin estudio, degradado a estimación por defecto). */
++function fakeFetch({ addresses = [CARILO], llmReplies = [] } = {}) {
++  const llmQueue = [...llmReplies];
++  const calls = [];
++  const fn = async (url) => {
++    const u = String(url && url.href ? url.href : url);
++    calls.push(u);
++    if (u.includes('maps.googleapis.com/maps/api/place/findplacefromtext')) return placesResponse(addresses);
++    if (u.includes('openrouter.ai')) {
++      const text = llmQueue.length > 1 ? llmQueue.shift() : (llmQueue[0] || '');
++      return llmResponse(text);
++    }
++    throw new Error(`unstubbed network call in test: ${u}`);
++  };
++  fn.calls = calls;
++  return fn;
++}
++
++async function open(name, text) {
++  // recordWebInbound's return value is the only place the raw (unhashed)
++  // webToken ever appears — the persisted thread keeps only its hash. Every
++  // later turn must carry that same token forward (never re-fetch it).
++  return store.recordWebInbound({ whatsapp: '+54 9 11 0000-0000', name, text, leadId: null, installerId: 'demo-installer', simulated: true, auto: true });
++}
++/* Un turno más en el mismo hilo: guarda el mensaje entrante y corre el
++ * respondedor sobre el hilo actualizado, como hace chat-routes#respond. */
++async function turn(thread, text, fetchImpl) {
++  const t = await store.appendWebInbound(thread.webToken, { text });
++  const r = await responder.answer({ thread: t, text, visitor: { name: t.name, whatsapp: t.whatsapp }, fetchImpl, host: 'usabruno.com' });
++  if (r.flags.length) await store.addFlags(t.id, r.flags);
++  const updated = await store.recordAutoReply(t.id, r);
++  return { thread: { ...updated, webToken: thread.webToken }, result: r };
++}
++
++const OPENERS = [
++  'quiero instalar solar, cuánto sale?',
++  'cuánto cuesta',
++  'precio para mi casa',
++  'quiero paneles',
++  'how much',
++  'i want to install solar, how much?',
++  'me pasás un presupuesto?',
++];
++
++for (const opener of OPENERS) {
++  test(`"${opener}" entra al estimador y pregunta la dirección, nunca la visita ni la lista de precios`, async () => {
++    const t = await open('Visitante ' + Math.random().toString(36).slice(2, 8), opener);
++    const r = await responder.answer({ thread: t, text: opener, visitor: { name: t.name, whatsapp: t.whatsapp }, fetchImpl: fakeFetch() });
++    assert.equal(r.mode, 'estimate');
++    assert.ok(r.estimate && r.estimate.step === 'address', `esperaba el paso 'address', llegó '${r.estimate && r.estimate.step}'`);
++    assert.doesNotMatch(r.text, /mañana|tarde|visita t[eé]cnica|USD \d/i, 'nunca la visita ni un precio de una');
++    assert.match(r.text, /direcci[oó]n|address/i);
++  });
++}
++
++test('camino feliz: dirección → dueño → consumo → qué busca → nombre → contacto termina con el link al informe', async () => {
++  // Sin nombre en el hilo (mensaje directo, sin el formulario nombre+whatsapp):
++  // el flujo pasa por los 6 pasos, incluido "¿cómo te llamás?".
++  const t0 = await open('', 'quiero instalar solar, cuánto sale?');
++  const fetchImpl = fakeFetch({ addresses: [CARILO] });
++  let last = await responder.answer({ thread: t0, text: t0.messages[0].text, visitor: {}, fetchImpl });
++  let thread = { ...(await store.recordAutoReply(t0.id, last)), webToken: t0.webToken };
++  assert.equal(last.estimate.step, 'address');
++
++  ({ thread, result: last } = await turn(thread, 'Avenida Ejemplo, Cariló, Pinamar', fetchImpl));
++  assert.equal(last.estimate.step, 'ownership', 'una sola dirección resuelve y avanza directo a dueño/inquilino');
++
++  ({ thread, result: last } = await turn(thread, 'es mía', fetchImpl));
++  assert.equal(last.estimate.step, 'consumption');
++
++  ({ thread, result: last } = await turn(thread, '300 kwh', fetchImpl));
++  assert.equal(last.estimate.step, 'goal');
++
++  ({ thread, result: last } = await turn(thread, 'quiero ahorrar en la factura', fetchImpl));
++  assert.equal(last.estimate.step, 'name');
++
++  ({ thread, result: last } = await turn(thread, 'Marcela', fetchImpl));
++  assert.equal(last.estimate.step, 'contact');
++
++  ({ thread, result: last } = await turn(thread, 'marcela@example.com', fetchImpl));
++  assert.equal(last.estimate.step, 'done');
++  assert.equal(last.mode, 'estimate');
++  assert.ok(last.links && last.links.length === 1, 'un solo link al informe');
++  assert.match(last.links[0].href, /^https:\/\/usabruno\.com\/quote\/results\/[^/]+\?t=/);
++  assert.match(last.text, /paneles|panels/i);
++
++  const customerLeads = require('../lib/customer-leads');
++  const url = new URL(last.links[0].href);
++  const id = url.pathname.split('/').pop();
++  const accessToken = url.searchParams.get('t');
++  const lead = customerLeads.get(id, accessToken);
++  assert.ok(lead, 'el link resuelve a un lead real, protegido por el token de acceso');
++  assert.equal(lead.contact.name, 'Marcela');
++  assert.equal(lead.contact.email, 'marcela@example.com');
++  assert.equal(lead.analysis.consumptionSource === 'monthly-bill' ? lead.intake.monthlyBillArs : lead.intake.monthlyKwh, 300);
++  assert.ok(lead.analysis.panelRange, 'el control de paneles del informe queda armado (vow: cantidad ajustable)');
++});
++
++test('"no sé" el consumo cae al caso de muestra publicado, nunca a un techo arbitrario', async () => {
++  const t0 = await open('Tomás Ruiz', 'precio para mi casa');
++  const fetchImpl = fakeFetch({ addresses: [PINAMAR] });
++  let thread = { ...(await store.recordAutoReply(t0.id, await responder.answer({ thread: t0, text: t0.messages[0].text, visitor: { name: 'Tomás Ruiz' }, fetchImpl }))), webToken: t0.webToken };
++
++  let step;
++  ({ thread, result: step } = await turn(thread, 'Avenida del Mar, Pinamar', fetchImpl));
++  assert.equal(step.estimate.step, 'ownership');
++  ({ thread, result: step } = await turn(thread, 'alquilo', fetchImpl));
++  assert.equal(step.estimate.step, 'consumption');
++  ({ thread, result: step } = await turn(thread, 'no sé', fetchImpl));
++  assert.equal(step.estimate.step, 'goal', 'no saber el consumo no traba el flujo');
++  assert.equal(step.estimate.data.monthlyKwh, undefined, 'sin consumo forzado: preliminaryQuote arma con el caso de muestra');
++});
++
++test('una pregunta suelta a mitad del flujo se contesta y repite lo pendiente en el mismo mensaje', async () => {
++  const t0 = await open('Lucía Paz', 'cuánto cuesta');
++  const fetchImpl = fakeFetch({ addresses: [VALERIA], llmReplies: ['Las baterías cubren una noche de lo esencial.'] });
++  let thread = { ...(await store.recordAutoReply(t0.id, await responder.answer({ thread: t0, text: t0.messages[0].text, visitor: { name: 'Lucía Paz' }, fetchImpl }))), webToken: t0.webToken };
++  let step;
++  ({ thread, result: step } = await turn(thread, 'Calle Central, Valeria del Mar', fetchImpl));
++  assert.equal(step.estimate.step, 'ownership');
++  ({ thread, result: step } = await turn(thread, 'la tengo alquilada', fetchImpl));
++  assert.equal(step.estimate.step, 'consumption');
++  // Se desvía con una pregunta suelta en vez de contestar el consumo.
++  ({ thread, result: step } = await turn(thread, '¿las baterías duran toda la noche?', fetchImpl));
++  assert.equal(step.estimate.step, 'consumption', 'la interrupción no avanza el paso pendiente');
++  assert.match(step.text, /baterías/i, 'el modelo contestó la pregunta suelta');
++  assert.match(step.text, /consum|kwh|factura/i, 'y repitió la pregunta de consumo pendiente en el mismo mensaje');
++});
++
++test('dirección ambigua: se ofrece una lista numerada y una elección clara la resuelve', async () => {
++  const t0 = await open('Beto Sosa', 'me pasás un presupuesto?');
++  const candidates = [CARILO, PINAMAR, VALERIA];
++  const fetchImpl = fakeFetch({ addresses: candidates });
++  let thread = { ...(await store.recordAutoReply(t0.id, await responder.answer({ thread: t0, text: t0.messages[0].text, visitor: { name: 'Beto Sosa' }, fetchImpl }))), webToken: t0.webToken };
++
++  let step;
++  ({ thread, result: step } = await turn(thread, 'Avenida Costanera, Buenos Aires', fetchImpl));
++  assert.equal(step.estimate.step, 'address_choice', 'varias direcciones encontradas: se pregunta cuál es');
++  assert.equal((step.text.match(/^\d\)/gm) || []).length, 3, 'lista numerada de a lo sumo 3');
++  assert.match(step.text, new RegExp(candidates[0].label));
++  assert.match(step.text, new RegExp(candidates[1].label));
++  assert.match(step.text, new RegExp(candidates[2].label));
++
++  ({ thread, result: step } = await turn(thread, '2', fetchImpl));
++  assert.equal(step.estimate.step, 'ownership', 'elegir la opción 2 resuelve la dirección y avanza');
++  assert.equal(step.estimate.data.address, PINAMAR.label);
++});
+diff --git a/test/chat-replay.test.js b/test/chat-replay.test.js
+index 7ada0b1..88bd82b 100644
+--- a/test/chat-replay.test.js
++++ b/test/chat-replay.test.js
+@@ -48,8 +48,8 @@ async function turn(thread, text, fetchImpl) {
+ }
+ 
+ test('un lead normal recibe la redacción del modelo, en castellano, sin banderas', async () => {
+-  const fetchImpl = fakeFetch(['Hola Marcela. Para una casa que consume 450 kWh el plan Económico ronda los USD 3.600 y el Óptimo con dos baterías USD 8.000. ¿Sabés más o menos cuánto pagás de luz?']);
+-  const t = await open('Marcela Ferreyra', 'Hola, tengo una casa en Cariló y quiero saber cuánto sale poner paneles.');
++  const fetchImpl = fakeFetch(['Hola Marcela. El inversor y los paneles llevan garantía extendida, y la mano de obra también. ¿Hay algo más puntual que quieras saber?']);
++  const t = await open('Marcela Ferreyra', 'Hola, tengo una casa en Cariló, ¿qué garantía tiene el sistema?');
+   const r = await responder.answer({ thread: t, text: t.messages[0].text, visitor: { name: 'Marcela Ferreyra', whatsapp: t.whatsapp }, fetchImpl });
+   assert.equal(r.mode, 'model');
+   assert.equal(r.language, 'es');
+@@ -155,7 +155,7 @@ test('pedir una persona o un reclamo escala en el acto con el mensaje de pase',
+ test('sin clave, o con el tope diario agotado, contesta la respuesta segura y nunca falla', async () => {
+   const saved = process.env.BRUNO_OPENROUTER_API_KEY;
+   delete process.env.BRUNO_OPENROUTER_API_KEY;
+-  const t = await open('Tomás Ruiz Díaz', 'hola precio de paneles para casa en pinamar?');
++  const t = await open('Tomás Ruiz Díaz', 'hola, tengo una casa en pinamar y una duda sobre la garantía');
+   const r = await responder.answer({ thread: t, text: t.messages[0].text });
+   assert.equal(r.mode, 'fallback');
+   assert.match(r.text, /Bruno/);
+@@ -175,7 +175,7 @@ test('sin clave, o con el tope diario agotado, contesta la respuesta segura y nu
+ 
+ test('el modelo nunca ve el teléfono ni el mail del visitante en el historial', async () => {
+   const fetchImpl = fakeFetch(['Dale, ¿en qué zona está la casa?']);
+-  const t = await open('Nicolás Barraza', 'mi tel es +54 9 11 0000-0000y mi mail nico@ejemplo.invalid, pasame precio');
++  const t = await open('Nicolás Barraza', 'mi tel es +54 9 11 0000-0000y mi mail nico@ejemplo.invalid, contame de la garantía');
+   await responder.answer({ thread: t, text: t.messages[0].text, visitor: { name: 'Nicolás Barraza', whatsapp: '+54 9 11 0000-0000', email: 'nico@ejemplo.invalid' }, fetchImpl });
+   const sent = JSON.stringify(fetchImpl.calls[0].messages);
+   assert.ok(!sent.includes('0000-0099'));
+diff --git a/test/chat-web-thread.test.js b/test/chat-web-thread.test.js
+index 1e99fd4..30c930b 100644
+--- a/test/chat-web-thread.test.js
++++ b/test/chat-web-thread.test.js
+@@ -40,7 +40,7 @@ let threadId;
+ 
+ test('abrir un hilo devuelve el token, la respuesta del negocio y la vista del visitante sin datos internos', async () => {
+   const port = server.address().port;
+-  const r = await request(port, { method: 'POST', pathname: '/api/chat/start', json: { nombre: 'Marcela Ferreyra', whatsapp: '+54 9 11 0000-0000', message: 'Hola, quiero un precio para una casa en Cariló', followupConsent: true } });
++  const r = await request(port, { method: 'POST', pathname: '/api/chat/start', json: { nombre: 'Marcela Ferreyra', whatsapp: '+54 9 11 0000-0000', message: 'Hola, tengo una consulta sobre mi instalación en Cariló', followupConsent: true } });
+   assert.equal(r.status, 200);
+   const body = json(r);
+   assert.ok(body.token && body.token.length > 20);
