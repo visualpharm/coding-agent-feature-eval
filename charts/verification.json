@@ -1,5 +1,5 @@
 {
-  "points": 6,
+  "points": 8,
   "score_domain": [
     6,
     10
@@ -10,9 +10,8 @@
   "point_outlines": 0,
   "pareto_curve": "Monotone visual guide through observed frontier points, not measured intermediate results",
   "pareto_ids": [
-    "codex-astra-low",
-    "glm-zcode",
-    "glm-claude-code",
+    "glm-flash-zcode",
+    "spark-muse",
     "fable-low"
   ]
 }

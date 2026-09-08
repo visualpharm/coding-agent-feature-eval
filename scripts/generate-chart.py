@@ -12,7 +12,7 @@ d=json.loads((ROOT/'data/experiment-data.json').read_text());runs=d['runs']
 plt.rcParams.update({'font.family':'DejaVu Sans','font.size':15,'text.color':'#252525','axes.labelcolor':'#252525','xtick.color':'#252525','ytick.color':'#252525','svg.fonttype':'none'})
 fig,ax=plt.subplots(figsize=(16,9),facecolor='white');fig.subplots_adjust(left=.07,right=.97,top=.79,bottom=.14)
 fig.text(.07,.935,'Which agent is the best subagent?',fontsize=29,weight='bold',va='center')
-colors={'Anthropic':'#db7549','Z.ai':'#2563eb','OpenAI':'#171717'}
+colors={'Anthropic':'#db7549','Z.ai':'#2563eb','OpenAI':'#171717','Meta':'#0668E1'}
 handles=[Line2D([],[],marker='o',linestyle='',color=c,markersize=8,label=n) for n,c in colors.items()]
 fig.legend(handles=handles,loc='upper left',bbox_to_anchor=(.062,.9),frameon=False,ncol=3,handletextpad=.4,columnspacing=1.8)
 ax.set_xlim(0,1.5);ax.set_ylim(6,10)
@@ -24,7 +24,7 @@ ax.text(0,1.035,'Score out of 10 ↑',transform=ax.transAxes,fontsize=16)
 ax.set_xlabel('Estimated subscription dollars per task',labelpad=22,fontsize=17)
 frontier=[r for r in runs if not any(o['sub_usd']<=r['sub_usd'] and o['score']>=r['score'] and (o['sub_usd']<r['sub_usd'] or o['score']>r['score']) for o in runs)]
 frontier.sort(key=lambda r:r['sub_usd'])
-assert [r['id'] for r in frontier]==['codex-astra-low','glm-zcode','glm-claude-code','fable-low']
+assert [r['id'] for r in frontier]==['glm-flash-zcode','spark-muse','fable-low']
 # Shape-preserving cubic Hermite guide through observed nondominated points.
 xp=np.array([r['sub_usd'] for r in frontier]);yp=np.array([r['score']/2 for r in frontier])
 h=np.diff(xp);delta=np.diff(yp)/h
@@ -50,11 +50,13 @@ labels={
 'opus-low':('Opus 5 low · Claude Code',(13,0),'left','center'),
 'glm-claude-code':('GLM 5.3 · Claude Code',(12,32),'left','bottom'),
 'glm-zcode':('GLM 5.3 · ZCode',(12,-12),'left','top'),
+'glm-flash-zcode':('GLM 5.3 Flash · ZCode',(10,10),'left','bottom'),
+'spark-muse':('Muse Spark 1.3 · Muse Code',(0,26),'center','bottom'),
 'sonnet-medium':('Sonnet 5 medium · Claude Code',(12,0),'left','center'),
 'codex-astra-low':('GPT-6 Astra low · Codex',(12,-12),'left','top')}
 anns=[]
 for r in runs:
- family='Anthropic' if r['model'].startswith('claude') else 'Z.ai' if r['model'].startswith('glm') else 'OpenAI'
+ family='Anthropic' if r['model'].startswith('claude') else 'Z.ai' if r['model'].startswith('glm') else 'Meta' if r['model'].startswith('muse') else 'OpenAI'
  x,y=r['sub_usd'],r['score']/2
  ax.scatter([x],[y],s=105,color=colors[family],edgecolors='none',zorder=5)
  name,offset,ha,va=labels[r['id']]
@@ -63,5 +65,5 @@ fig.canvas.draw();renderer=fig.canvas.get_renderer();boxes=[Text.get_window_exte
 assert not [(i,j) for i,a in enumerate(boxes) for j,b in enumerate(boxes) if i<j and a.overlaps(b)]
 assert all(fig.bbox.contains(b.x0,b.y0) and fig.bbox.contains(b.x1,b.y1) for b in boxes)
 for ext in ['png','svg','pdf']:fig.savefig(OUT/f'best-subagent.{ext}',dpi=200,facecolor='white',metadata={'Title':'Which agent is the best subagent?'})
-(OUT/'verification.json').write_text(json.dumps({'points':6,'score_domain':[6,10],'cost_scale':'linear','label_overlaps':0,'label_connectors':0,'point_outlines':0,'pareto_curve':'Monotone visual guide through observed frontier points, not measured intermediate results','pareto_ids':[r['id'] for r in frontier]},indent=2))
-print('PNG, SVG, PDF exported; six labels and Pareto frontier verified.')
+(OUT/'verification.json').write_text(json.dumps({'points':8,'score_domain':[6,10],'cost_scale':'linear','label_overlaps':0,'label_connectors':0,'point_outlines':0,'pareto_curve':'Monotone visual guide through observed frontier points, not measured intermediate results','pareto_ids':[r['id'] for r in frontier]},indent=2))
+print('PNG, SVG, PDF exported; eight labels and Pareto frontier verified.')

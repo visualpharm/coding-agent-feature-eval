@@ -2,7 +2,7 @@
   "experiment": {
     "date": "2026-09-07",
     "title": "Six coding agents, one real feature",
-    "task_summary": "Rebuild Bruno's public chat bot so that a price question runs the site's real solar estimator in conversation form: a deterministic bilingual intent gate before the LLM, a one-question-per-message step machine (address via the wizard's geocoder with a numbered pick when ambiguous, owner/renter, monthly kWh or bill with 'no s\u00e9' falling back to the published sample home, savings-vs-backup goal, name, email or WhatsApp), lead creation through the same server libraries the wizard uses, the real roof and pricing analysis, a two-sentence summary with a link to the generated report, a prompt cleanup, an interruption path, a new test file, the repo's publication gate and a real end-to-end conversation against a throwaway server with the private data pack.",
+    "task_summary": "Rebuild Bruno's public chat bot so that a price question runs the site's real solar estimator in conversation form: a deterministic bilingual intent gate before the LLM, a one-question-per-message step machine (address via the wizard's geocoder with a numbered pick when ambiguous, owner/renter, monthly kWh or bill with 'no sé' falling back to the published sample home, savings-vs-backup goal, name, email or WhatsApp), lead creation through the same server libraries the wizard uses, the real roof and pricing analysis, a two-sentence summary with a link to the generated report, a prompt cleanup, an interruption path, a new test file, the repo's publication gate and a real end-to-end conversation against a throwaway server with the private data pack.",
     "repo": "Bruno (Node, ~1,080 tests), private repository",
     "base_commit": "ad1feac",
     "prompt_chars": 6035,
@@ -24,6 +24,11 @@
         "fee_usd": 200,
         "monthly_api_equiv_usd": 7000,
         "source": "Coding-agent subscription article central case"
+      },
+      "meta_payg": {
+        "fee_usd": null,
+        "monthly_api_equiv_usd": null,
+        "source": "Pay-as-you-go Model API: subscription dollars equal API dollars, nothing amortized"
       }
     },
     "prices_per_million": {
@@ -68,6 +73,19 @@
         "cache_read": 0.5,
         "cache_write": 6.25,
         "cache_write_1h": 10
+      },
+      "glm-5.3-flash": {
+        "input": 0.15,
+        "output": 0.5,
+        "cache_read": 0.03,
+        "cache_write": 0.15,
+        "cache_write_1h": null
+      },
+      "muse-spark-1.3-contributor": {
+        "input": 0.1,
+        "output": 0.2,
+        "cache_read": 0.002,
+        "cache_write": null
       }
     }
   },
@@ -199,6 +217,58 @@
           "sub_usd": 0.9267951142857144
         }
       }
+    },
+    {
+      "id": "spark-muse",
+      "label": "Muse Spark 1.3 Contributor via Muse Code",
+      "harness": "Muse Code",
+      "model": "muse-spark-1.3-contributor",
+      "effort": "default",
+      "plan": "meta_payg",
+      "score": 18,
+      "wall_min": 33,
+      "turns": 280,
+      "tool_calls": 153,
+      "tokens": {
+        "input": 260611,
+        "output": 94403,
+        "cache_read": 21649438,
+        "cache_write": 0
+      },
+      "api_usd": 0.088240576,
+      "sub_usd": 0.088240576,
+      "weekly_share_pct": null,
+      "rubric": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1.5,
+        2,
+        1,
+        1.5
+      ],
+      "notes": [
+        "Ties GLM 5.3 via Claude Code on score at ~1/3 the cost; conversation edges sound where both ZCode runs leak",
+        "Live e2e stopped at the address step: geocoder key absent in the redacted demo-pack environment, disclosed not faked",
+        "Out-of-lane 96-line server.js extraction (byte-identical move, export already existed at base) and trailer on the final commit only",
+        "External provider run: prompt redacted (no team names, demo pack only); PAYG pricing so subscription $ equals API $",
+        "Cache semantics proven subset by live probe (identical repeat call: prompt_tokens unchanged, cached_tokens set); prices verified against OpenRouter"
+      ],
+      "cost_components": {
+        "muse-spark-1.3-contributor": {
+          "tokens": {
+            "input": 260611,
+            "output": 94403,
+            "cache_read": 21649438,
+            "cache_write": 0
+          },
+          "api_usd": 0.088240576
+        }
+      },
+      "date_added": "2026-09-08"
     },
     {
       "id": "glm-claude-code",
@@ -336,6 +406,58 @@
       "comparison_scope": "Cost and tokens are the arithmetic mean per session. The 8.75/10 grade and recorded wall time describe their shared final branch, not two independently graded attempts."
     },
     {
+      "id": "glm-flash-zcode",
+      "label": "GLM 5.3 Flash via ZCode",
+      "harness": "ZCode",
+      "model": "glm-5.3-flash",
+      "effort": "default (reasoning: max)",
+      "plan": "glm_pro_annual",
+      "score": 17.5,
+      "wall_min": 59,
+      "turns": 129,
+      "tool_calls": 135,
+      "tokens": {
+        "input": 271580,
+        "output": 105901,
+        "cache_read": 18775296,
+        "cache_write": 0
+      },
+      "api_usd": 0.6569464,
+      "sub_usd": 0.0282985,
+      "weekly_share_pct": 0.2189821,
+      "rubric": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1.5,
+        2,
+        1.5,
+        1.5
+      ],
+      "notes": [
+        "Ties full GLM 5.3 on the same harness at ~1/4 the subscription cost; best conversation edges of the three GLM runs",
+        "Prompt cleanup half done: Pablo survives in 6 places, no nosotros rule",
+        "Only run whose entire gate the reviewer reproduced (14 base failures verified at ad1feac)"
+      ],
+      "cost_components": {
+        "glm-5.3-flash": {
+          "tokens": {
+            "input": 271580,
+            "output": 105901,
+            "cache_read": 18775296,
+            "cache_write": 0
+          },
+          "api_usd": 0.6569464,
+          "sub_usd": 0.0282985,
+          "source": "ZCode turn_usage table, sess_2ed52fc2 (single headless turn, 129 model requests); 0 reasoning tokens recorded"
+        }
+      },
+      "date_added": "2026-09-08"
+    },
+    {
       "id": "sonnet-medium",
       "label": "Sonnet 5 medium",
       "harness": "Claude Code",
@@ -448,7 +570,7 @@
           "one_hour_cache_write_tokens": 0,
           "api_usd": 6.052854,
           "sub_usd": 0.17293868571428572,
-          "source": "Codex turn.completed cumulative usage, counted once; fresh input = input \u2212 cached"
+          "source": "Codex turn.completed cumulative usage, counted once; fresh input = input − cached"
         }
       }
     }
@@ -457,7 +579,7 @@
     "Intent gate catches all 7 openers in both languages",
     "Step machine, parsers, skips known data",
     "Reuses the wizard's geocoder, numbered pick of at most 3",
-    "'no s\u00e9' falls back to the published sample size",
+    "'no sé' falls back to the published sample size",
     "Lead and report through the real libraries, correct money",
     "Prompt cleanup: no price dump, no early visit, 'nosotros'",
     "Interruption answered, then the pending question repeated",

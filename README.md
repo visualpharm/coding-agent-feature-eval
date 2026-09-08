@@ -8,7 +8,10 @@ through the Claude Code harness, GLM 5.3 through ZCode, and Codex CLI on
 GPT-6 Astra (low) — each in its own git worktree cut at the same base commit,
 same prompt, same gate. One reviewer graded all branches on a 10-item rubric
 with file-level evidence and re-ran the tests; token burn was measured from
-each harness's own session logs and priced at list rates.
+each harness's own session logs and priced at list rates. A
+[dated addendum](#addendum-2026-09-08) below adds two more runs on the same
+base commit and prompt: GLM 5.3 Flash via ZCode and Meta's Muse Spark 1.3
+Contributor via Muse Code.
 
 The feature under test lives on [Bruno](https://usabruno.com/), a solar-quote
 platform; the host repository is private and is **not** part of this repo.
@@ -23,6 +26,8 @@ platform; the host repository is private and is **not** part of this repo.
 | GLM 5.3 · ZCode (default, reasoning: max) | 8.75 | 36 min | $4.39 | $0.19 | 1.5% |
 | Codex GPT-6 Astra low · Codex CLI | 7.75 | 14 min | $6.05 | $0.17 | 0.4% |
 | Sonnet 5 medium · Claude Code | 7.00 | 41 min | $13.57 | $0.78 | 3.4% |
+| GLM 5.3 Flash · ZCode *(addendum)* | 8.75 | 59 min | $0.66 | $0.03 | 0.2% |
+| Muse Spark 1.3 Contributor · Muse Code *(addendum)* | 9.00 | 33 min | $0.09 | $0.09 | — pay as you go |
 
 Full per-run data — deduplicated token counts, per-model cost components with
 cache-TTL split, list prices, plan allowances, per-item rubric scores, grader
@@ -44,6 +49,36 @@ cost-quality frontier on these numbers is Codex Astra low → GLM 5.3 via ZCode
 → GLM 5.3 via Claude Code → Fable 5.1 low. Plan allowances are inherited estimates, not remeasured
 by the correction — subscription dollars are modeled allocations, not observed
 charges. `scripts/audit.py` reproduces the correction from the original logs.
+
+## Addendum (2026-09-08)
+
+Two more runs, same base commit (`ad1feac`), same prompt, same rubric and the
+same Fable 5.1 reviewer; full evidence in the last two sections of
+[`grading.md`](grading.md).
+
+- **GLM 5.3 Flash via ZCode: 17.5/20 (8.75/10), $0.03 of subscription per
+  task.** It ties full GLM 5.3 on the same harness at roughly a quarter of the
+  cost and becomes the cheapest point on the chart. The prompt cleanup was
+  half-done (six surviving name mentions, no "nosotros" rule), which is most
+  of the gap to the full model's 18.
+- **Meta Muse Spark 1.3 Contributor via Muse Code: 18/20 (9.00/10), $0.09 —
+  pay as you go.** An external-provider run, so the prompt was redacted (no
+  team names; the live end-to-end check ran on the demo data pack with no
+  private keys, and the missing geocoder key is disclosed, not faked). It ties
+  GLM 5.3 via Claude Code on score at about a third of the cost — with the
+  deepest test suite of the eight runs — so GLM via Claude Code leaves the
+  cost-quality frontier. Cost accounting: usage from the Muse Code session
+  export, cache semantics verified by a live probe (a repeated call keeps
+  `prompt_tokens` unchanged and reports the cached share separately — the
+  Anthropic/OpenAI subset convention), priced at list rates with no
+  subscription to amortize.
+- A third addendum run, GLM 5.3 Flash through the Claude Code harness, was
+  attempted twice and died both times inside the GLM plan's request-rate and
+  five-hour usage limits; its final attempt and this README's frontier wording
+  settle after that resolves.
+
+The frontier after the addendum: GLM 5.3 Flash via ZCode → Muse Spark 1.3 via
+Muse Code → Fable 5.1 low.
 
 ## Caveats — what you cannot reproduce from this repo
 
